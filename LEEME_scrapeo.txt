@@ -1,0 +1,40 @@
+SCRAPEO NACIONAL DE ACTAS MUNICIPALES 2024-2025
+
+PROCEDIMIENTO PARA EMPEZAR DESDE CERO:
+  1. Ejecutar 0_limpiar_y_empezar_desde_cero.bat. 
+!!! Cuidado !!! Procura ejecutar esto siempre en una carpeta aislada 
+	para no borrar todas las municipalidades
+  2. Confirmar la limpieza cuando Windows lo solicite.
+  3. Dejar abierta la ventana mientras el scraper trabaja.
+  4. Revisar avance con ver_estado_scrapeo.bat.
+
+PROCEDIMIENTO PARA REANUDAR:
+  Ejecutar nuevamente ejecutar_scrapeo_nacional_firefox.bat.
+  El scraper omitira URLs descargadas y municipalidades completadas.
+
+Que hace:
+  - Recorre las 345 municipalidades del archivo municipalidades_portal_345.csv.
+  - Usa Firefox en segundo plano.
+  - Busca las actas de concejo municipal de 2024 y 2025.
+  - Guarda los documentos en: D:\trabajo max\municipalidad\anio\
+  - Nombra los archivos usando la fecha del acta.
+
+Archivos de control:
+  - actas_descargadas_metadata.csv: detalle y URL de cada acta descargada.
+  - estado_municipalidades.csv: estado de cada municipalidad.
+  - fallas_scrapeo.txt: municipalidades que requieren revision.
+  - ejecucion_scraper.log: salida completa de la ejecucion.
+
+Reanudacion:
+  Puede detener el proceso con Ctrl+C. Al ejecutar nuevamente el archivo BAT,
+  se omiten las municipalidades marcadas como completadas y las URLs ya descargadas.
+
+Recomendaciones:
+  - Mantener el equipo conectado a corriente e Internet.
+  - Evitar que Windows entre en suspension.
+  - No cerrar la ventana del proceso mientras este trabajando.
+  - No es necesario instalar Chrome.
+  - La primera ejecucion con Firefox intentara descargar geckodriver automaticamente.
+
+Prueba corta:
+  Ejecutar probar_scraper_firefox.bat para descargar una sola acta de Linares.
