@@ -11,11 +11,21 @@ PROCEDIMIENTO PARA EMPEZAR DESDE CERO:
 PROCEDIMIENTO PARA REANUDAR:
   Ejecutar nuevamente ejecutar_scrapeo_nacional_firefox.bat.
   El scraper omitira URLs descargadas y municipalidades completadas.
+  Para continuar solamente la primera pasada, usar 1_continuar_primera_pasada.bat.
+  Para reintentar errores, usar 2_reintentar_errores.bat.
+  Si algunos errores persisten, usar 3_reintentar_errores_chrome.bat.
 
 Que hace:
   - Recorre las 345 municipalidades del archivo municipalidades_portal_345.csv.
   - Usa Firefox en segundo plano.
   - Busca las actas de concejo municipal de 2024 y 2025.
+  - Reconoce tambien secciones llamadas Actas de Organos Colegiados cuando
+    corresponden al Concejo Municipal.
+  - Recorre por separado las ramas de sesiones ordinarias y extraordinarias.
+  - Admite actas organizadas por mes o publicadas directamente bajo el año.
+  - Convierte enlaces de vista previa de SharePoint y Dropbox en descargas directas.
+  - Si una fila existe pero su enlace oficial responde 404, registra la
+    municipalidad como parcial y continua con las actas siguientes.
   - Guarda los documentos en: D:\trabajo max\municipalidad\anio\
   - Nombra los archivos usando la fecha del acta.
 
@@ -28,12 +38,15 @@ Archivos de control:
 Reanudacion:
   Puede detener el proceso con Ctrl+C. Al ejecutar nuevamente el archivo BAT,
   se omiten las municipalidades marcadas como completadas y las URLs ya descargadas.
+  Al terminar o interrumpir una ejecucion se actualizan automaticamente:
+  - municipalidades_pendientes_primera_pasada.csv
+  - municipalidades_para_reintentar.csv
 
 Recomendaciones:
   - Mantener el equipo conectado a corriente e Internet.
   - Evitar que Windows entre en suspension.
   - No cerrar la ventana del proceso mientras este trabajando.
-  - No es necesario instalar Chrome.
+  - Firefox es el navegador principal. Chrome se usa como alternativa de reintento.
   - La primera ejecucion con Firefox intentara descargar geckodriver automaticamente.
 
 Prueba corta:

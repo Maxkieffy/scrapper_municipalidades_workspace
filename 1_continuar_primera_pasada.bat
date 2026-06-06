@@ -12,8 +12,17 @@ echo Puede detener el proceso con Ctrl+C y volver a ejecutar este archivo.
 echo No cierre esta ventana mientras este trabajando.
 echo.
 
-"%PYTHON%" "%SCRIPT%" --input-csv "%CSV%" --output-dir "%BASE%" --years 2024 2025 --selenium --browser firefox
+if not exist "%CSV%" (
+  echo No existe "%CSV%".
+  echo Ejecute primero ejecutar_scrapeo_nacional_firefox.bat para crear la lista.
+  pause
+  exit /b 1
+)
+
+"%PYTHON%" "%SCRIPT%" --input-csv "%CSV%" --output-dir "%BASE%." --years 2024 2025 --selenium --browser firefox
+set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
 echo Primera pasada terminada o interrumpida.
 pause
+exit /b %EXIT_CODE%

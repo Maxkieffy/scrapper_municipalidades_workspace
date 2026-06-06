@@ -14,5 +14,11 @@ echo Se intentara detener el proceso de scrapeo con PID %PID%.
 choice /M "Desea detenerlo ahora"
 if errorlevel 2 exit /b 0
 
-taskkill /PID %PID% /T
+taskkill /PID %PID% /T /F
+if errorlevel 1 (
+  echo No se pudo detener el proceso. Puede que ya haya terminado.
+) else (
+  del /Q "%BASE%scraper_nacional.pid" 2>nul
+  echo Proceso detenido.
+)
 pause

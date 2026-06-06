@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import unicodedata
 import zipfile
@@ -234,6 +235,9 @@ def normalize_download_url(url: str) -> str:
     if "dropbox.com" in parsed.netloc and "dl=1" not in parsed.query:
         separator = "&" if parsed.query else "?"
         normalized = f"{url}{separator}dl=1"
+    elif "sharepoint.com" in parsed.netloc and "download=1" not in parsed.query:
+        separator = "&" if parsed.query else "?"
+        normalized = f"{url}{separator}download=1"
     elif any(
         token in normalized
         for token in (
@@ -285,6 +289,46 @@ def extension_from_response(response: requests.Response, url: str) -> str:
             return extension
 
     return ".bin"
+
+
+def validate_download_file(path: Path, expected_extension: str) -> str:
+    if path.stat().st_size == 0:
+        raise PortalScraperError("el archivo descargado esta vacio")
+
+    with path.open("rb") as fh:
+        header = fh.read(4096)
+
+    stripped = header.lstrip()
+    lower = stripped.lower()
+    if lower.startswith((b"<!doctype html", b"<html", b"<head", b"<body")) or b"<html" in lower[:1024]:
+        raise PortalScraperError("el servidor devolvio HTML en vez de un documento")
+
+    detected_extension = None
+    if b"%PDF-" in header[:1024]:
+        detected_extension = ".pdf"
+    elif header.startswith(b"PK\x03\x04"):
+        detected_extension = ".zip"
+    elif header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") or stripped.startswith(b"{\\rtf"):
+        detected_extension = ".doc"
+    elif header.startswith(b"Rar!\x1a\x07"):
+        detected_extension = ".rar"
+
+    expected_signatures = {
+        ".pdf": {".pdf"},
+        ".doc": {".doc"},
+        ".docx": {".zip"},
+        ".zip": {".zip"},
+        ".rar": {".rar"},
+    }
+    allowed = expected_signatures.get(expected_extension)
+    if allowed and detected_extension not in allowed:
+        raise PortalScraperError(
+            f"el contenido no corresponde a la extension esperada {expected_extension}"
+        )
+
+    if expected_extension == ".bin" and detected_extension:
+        return ".docx" if detected_extension == ".zip" else detected_extension
+    return expected_extension
 
 
 def choose_unique_path(target_path: Path) -> Path:
@@ -347,6 +391,31 @@ def create_webdriver(browser: str, session: requests.Session, tools_root: Path):
     raise PortalScraperError("Browser no soportado. Usa `firefox` o `chrome`.")
 
 
+def normalize_portal_label(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(
+        char for char in normalized
+        if unicodedata.category(char) != "Mn"
+    )
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def portal_label_matches(label: str, option: str) -> bool:
+    normalized_label = normalize_portal_label(label)
+    normalized_option = normalize_portal_label(option)
+    if not normalized_label or not normalized_option:
+        return False
+    if normalized_label == normalized_option:
+        return True
+    if normalized_label == f"mes {normalized_option}":
+        return True
+    if len(normalized_option) >= 8 and normalized_option in normalized_label:
+        return True
+    if normalized_option.isdigit():
+        return bool(re.search(rf"\b{re.escape(normalized_option)}\b", normalized_label))
+    return False
+
+
 def click_portal_link(driver, text_options: tuple[str, ...], timeout: int = 8) -> None:
     from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
     from selenium.webdriver.common.by import By
@@ -369,9 +438,121 @@ def click_portal_link(driver, text_options: tuple[str, ...], timeout: int = 8) -
             except StaleElementReferenceException as exc:
                 last_error = exc
 
+    def matching_element(current):
+        for element in current.find_elements(By.CSS_SELECTOR, "a.tab-link"):
+            try:
+                label = element.text
+                if any(portal_label_matches(label, option) for option in text_options):
+                    return element
+            except StaleElementReferenceException:
+                continue
+        return False
+
+    try:
+        element = WebDriverWait(driver, timeout).until(matching_element)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+        element.click()
+        return
+    except (TimeoutException, StaleElementReferenceException) as exc:
+        last_error = exc
+
     raise PortalScraperError(
         f"No se encontro el enlace del portal: {' / '.join(text_options)}"
     ) from last_error
+
+
+def click_acta_section_link(driver, timeout: int = 12) -> None:
+    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    preferred_options = (
+        "Actas de Concejo Municipal",
+        "Actas Concejo Municipal",
+        "Actas de Consejo Municipal",
+    )
+    try:
+        click_portal_link(driver, preferred_options, timeout=4)
+        return
+    except PortalScraperError:
+        pass
+
+    def matching_element(current):
+        candidates = []
+        for element in current.find_elements(By.CSS_SELECTOR, "a.tab-link"):
+            try:
+                label = normalize_portal_label(element.text)
+            except StaleElementReferenceException:
+                continue
+            if "acta" not in label:
+                continue
+            if "concejo" not in label and "consejo" not in label:
+                continue
+            if "video" in label:
+                continue
+            score = 0
+            if "municipal" in label:
+                score += 4
+            if "organo" in label and "colegiado" in label:
+                score += 3
+            if "actas de concejo" in label or "actas del concejo" in label:
+                score += 2
+            candidates.append((score, element))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else False
+
+    try:
+        element = WebDriverWait(driver, timeout).until(matching_element)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+        element.click()
+    except (TimeoutException, StaleElementReferenceException) as exc:
+        raise PortalScraperError(
+            "No se encontro una seccion de actas del concejo municipal."
+        ) from exc
+
+
+def click_concejo_parent_link(driver, timeout: int = 8) -> None:
+    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    def matching_element(current):
+        candidates = []
+        for element in current.find_elements(By.CSS_SELECTOR, "a.tab-link"):
+            try:
+                label = normalize_portal_label(element.text)
+            except StaleElementReferenceException:
+                continue
+            if "concejo" not in label and "consejo" not in label:
+                continue
+            if any(token in label for token in ("acta", "acuerdo", "video", "instalacion")):
+                continue
+            score = 2 if "municipal" in label else 1
+            candidates.append((score, element))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else False
+
+    try:
+        element = WebDriverWait(driver, timeout).until(matching_element)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+        element.click()
+    except (TimeoutException, StaleElementReferenceException) as exc:
+        raise PortalScraperError(
+            "No se encontro un nivel de Concejos Municipales."
+        ) from exc
+
+
+def portal_acta_branches(driver) -> list[str]:
+    branches: list[str] = []
+    for text in portal_link_texts(driver):
+        normalized = normalize_portal_label(text)
+        if parse_date(text):
+            continue
+        if "acta" not in normalized and "sesion" not in normalized:
+            continue
+        if "extraordinaria" in normalized:
+            branches.append(text)
+        elif "ordinaria" in normalized:
+            branches.append(text)
+    return list(dict.fromkeys(branches))
 
 
 def portal_link_texts(driver) -> list[str]:
@@ -422,20 +603,20 @@ def navigate_to_acta_level(
     portal_url: str,
     year: int,
     month: Optional[str] = None,
+    branch: Optional[str] = None,
 ) -> None:
     driver.get(portal_url)
     click_portal_link(driver, ("Actos y resoluciones con efectos sobre terceros",))
-    click_portal_link(
-        driver,
-        (
-            "Actas de Concejo Municipal",
-            "Actas Concejo Municipal",
-            "Actas de Consejo Municipal",
-        ),
-    )
-    click_portal_link(driver, (str(year),))
+    try:
+        click_acta_section_link(driver)
+    except PortalScraperError:
+        click_concejo_parent_link(driver)
+        click_acta_section_link(driver)
+    click_portal_link(driver, (str(year), f"Año {year}", f"Anio {year}"))
+    if branch:
+        click_portal_link(driver, (branch,))
     if month:
-        click_portal_link(driver, (month,))
+        click_portal_link(driver, (month, f"Mes {month}"))
 
 
 def discover_acta_rows_with_selenium(
@@ -466,12 +647,119 @@ def discover_acta_rows_with_selenium(
                 print(f"[WARN] {target.municipalidad}: {message}", flush=True)
                 continue
 
-            WebDriverWait(driver, 20).until(
-                lambda current: any(text in MONTHS for text in portal_link_texts(current))
-            )
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda current: (
+                        bool(portal_acta_branches(current))
+                        or any(
+                            any(portal_label_matches(text, month) for month in MONTHS)
+                            for text in portal_link_texts(current)
+                        )
+                        or any(
+                            parse_date(row["row_text"])
+                            and parse_date(row["row_text"]).year == year
+                            for row in portal_direct_rows(current)
+                        )
+                    )
+                )
+            except TimeoutException:
+                message = f"{year}: no se encontraron ramas, meses ni actas publicadas"
+                errors.append(message)
+                print(f"[WARN] {target.municipalidad}: {message}", flush=True)
+                continue
+
+            acta_branches = portal_acta_branches(driver)
+            if acta_branches:
+                print(
+                    f"[INFO] {target.municipalidad} {year}: "
+                    f"{len(acta_branches)} ramas de sesiones.",
+                    flush=True,
+                )
+                for branch in acta_branches:
+                    try:
+                        navigate_to_acta_level(
+                            driver,
+                            portal_url,
+                            year,
+                            branch=branch,
+                        )
+                        WebDriverWait(driver, 20).until(
+                            lambda current: any(
+                                parse_date(row["row_text"])
+                                and parse_date(row["row_text"]).year == year
+                                for row in portal_direct_rows(current)
+                            )
+                        )
+                        branch_rows = [
+                            row
+                            for row in portal_direct_rows(driver)
+                            if parse_date(row["row_text"])
+                            and parse_date(row["row_text"]).year == year
+                        ]
+                        print(
+                            f"[INFO] {target.municipalidad} {year} {branch}: "
+                            f"{len(branch_rows)} actas.",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        message = f"{year} {branch}: no se pudo listar: {exc}"
+                        errors.append(message)
+                        print(
+                            f"[WARN] {target.municipalidad}: {message}",
+                            flush=True,
+                        )
+                        continue
+
+                    for direct_row in branch_rows:
+                        raw_url = direct_row["url"]
+                        if raw_url in seen_urls:
+                            continue
+                        seen_urls.add(raw_url)
+                        rows.append(direct_row)
+                        print(
+                            f"[LINK] {target.municipalidad}: "
+                            f"{direct_row['row_text'][:120]}",
+                            flush=True,
+                        )
+                        if max_actas and len(rows) >= max_actas:
+                            return rows, errors
+                continue
+
             available_months = {
-                text for text in portal_link_texts(driver) if text in MONTHS
+                month
+                for month in MONTHS
+                if any(
+                    portal_label_matches(text, month)
+                    for text in portal_link_texts(driver)
+                )
             }
+            year_direct_rows = [
+                row
+                for row in portal_direct_rows(driver)
+                if parse_date(row["row_text"])
+                and parse_date(row["row_text"]).year == year
+            ]
+
+            if year_direct_rows:
+                print(
+                    f"[INFO] {target.municipalidad} {year}: "
+                    f"{len(year_direct_rows)} actas publicadas directamente.",
+                    flush=True,
+                )
+                for direct_row in year_direct_rows:
+                    raw_url = direct_row["url"]
+                    if raw_url in seen_urls:
+                        continue
+                    seen_urls.add(raw_url)
+                    rows.append(direct_row)
+                    print(
+                        f"[LINK] {target.municipalidad}: {direct_row['row_text'][:120]}",
+                        flush=True,
+                    )
+                    if max_actas and len(rows) >= max_actas:
+                        return rows, errors
+                continue
+
             print(
                 f"[INFO] {target.municipalidad} {year}: "
                 f"{len(available_months)} meses publicados.",
@@ -692,8 +980,11 @@ def filter_acta_rows(rows: Iterable[dict], years: set[int]) -> list[dict]:
     return filtered
 
 
-def infer_filename(date_value: Optional[datetime], description: str, url: str, response: requests.Response) -> str:
-    extension = extension_from_response(response, url)
+def infer_filename(
+    date_value: Optional[datetime],
+    description: str,
+    extension: str,
+) -> str:
     if date_value:
         return f"{date_value.strftime('%Y-%m-%d')}{extension}"
 
@@ -741,62 +1032,77 @@ def scrape_municipality(
         acta_rows = filter_acta_rows(candidate_rows, years)
 
     if not acta_rows:
-        raise PortalScraperError(
-            f"No se encontraron filas de actas para {target.municipalidad}. "
-            "Prueba con --selenium si el portal está renderizando contenido dinámico."
-        )
+        return [], extraction_errors
 
     municipality_dir = output_root / slugify(target.municipalidad)
     records: list[ActaRecord] = []
+    download_errors: list[str] = []
 
     for row in acta_rows:
-        raw_url = normalize_download_url(row["url"])
-        if raw_url in existing_urls:
-            print(f"[SKIP] Ya descargada: {raw_url}", flush=True)
-            continue
-
-        date_value = parse_date(f"{row['row_text']} {raw_url}")
-        if date_value is None:
-            year_match = re.search(r"\b(20\d{2})\b", row["row_text"])
-            if not year_match:
-                print(f"[WARN] Sin fecha clara para {raw_url}; se omite.", flush=True)
-                continue
-            date_value = datetime(int(year_match.group(1)), 1, 1)
-
-        year_dir = municipality_dir / str(date_value.year)
-        year_dir.mkdir(parents=True, exist_ok=True)
-
-        response = session.get(raw_url, stream=True, timeout=60)
+        raw_url = row.get("url") or ""
+        temporary_path: Optional[Path] = None
         try:
-            response.raise_for_status()
-            file_name = infer_filename(date_value, row["row_text"], raw_url, response)
+            raw_url = normalize_download_url(raw_url)
+            if raw_url in existing_urls:
+                print(f"[SKIP] Ya descargada: {raw_url}", flush=True)
+                continue
+
+            date_value = parse_date(f"{row['row_text']} {raw_url}")
+            if date_value is None:
+                raise PortalScraperError("no se pudo determinar una fecha valida para el acta")
+            if date_value.year not in years:
+                raise PortalScraperError(
+                    f"la fecha detectada {date_value:%Y-%m-%d} no corresponde a los anos solicitados"
+                )
+
+            year_dir = municipality_dir / str(date_value.year)
+            year_dir.mkdir(parents=True, exist_ok=True)
+
+            with session.get(raw_url, stream=True, timeout=120) as response:
+                response.raise_for_status()
+                expected_extension = extension_from_response(response, raw_url)
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=".descarga_",
+                    suffix=".part",
+                    dir=year_dir,
+                    delete=False,
+                ) as fh:
+                    temporary_path = Path(fh.name)
+                    for chunk in response.iter_content(chunk_size=1024 * 64):
+                        if chunk:
+                            fh.write(chunk)
+
+            extension = validate_download_file(temporary_path, expected_extension)
+            file_name = infer_filename(date_value, row["row_text"], extension)
             destination = choose_unique_path(year_dir / file_name)
+            temporary_path.replace(destination)
+            temporary_path = None
 
-            with destination.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=1024 * 64):
-                    if chunk:
-                        fh.write(chunk)
-        finally:
-            response.close()
-
-        records.append(
-            ActaRecord(
-                municipalidad=target.municipalidad,
-                codigo_portal=target.codigo_portal,
-                anio=date_value.year,
-                fecha_acta=date_value.strftime("%Y-%m-%d"),
-                descripcion=row["row_text"][:500],
-                url_descarga=raw_url,
-                ruta_archivo=str(destination),
-                fuente_portal=portal_url,
+            records.append(
+                ActaRecord(
+                    municipalidad=target.municipalidad,
+                    codigo_portal=target.codigo_portal,
+                    anio=date_value.year,
+                    fecha_acta=date_value.strftime("%Y-%m-%d"),
+                    descripcion=row["row_text"][:500],
+                    url_descarga=raw_url,
+                    ruta_archivo=str(destination),
+                    fuente_portal=portal_url,
+                )
             )
-        )
-        append_metadata_record(records[-1], output_root)
-        existing_urls.add(raw_url)
+            append_metadata_record(records[-1], output_root)
+            existing_urls.add(raw_url)
+            print(f"[OK] {destination.name}", flush=True)
+        except Exception as exc:
+            message = f"no se pudo descargar {raw_url or '[URL vacia]'}: {exc}"
+            download_errors.append(message)
+            print(f"[WARN] {target.municipalidad}: {message}", flush=True)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
-        print(f"[OK] {destination.name}", flush=True)
-
-    return records, extraction_errors
+    return records, extraction_errors + download_errors
 
 
 def load_targets_from_csv(csv_path: Path) -> list[MunicipalityTarget]:
@@ -985,8 +1291,114 @@ def load_completed_codes(output_root: Path) -> set[str]:
         return {
             row["codigo_portal"]
             for row in reader
-            if row.get("estado") == "completado" and row.get("codigo_portal")
+            if row.get("estado") in {"completado", "sin_actas"} and row.get("codigo_portal")
         }
+
+
+def load_latest_status_rows(output_root: Path) -> dict[str, dict[str, str]]:
+    status_path = output_root / "estado_municipalidades.csv"
+    if not status_path.exists():
+        return {}
+
+    latest: dict[str, dict[str, str]] = {}
+    with status_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        reader = csv.DictReader(fh, dialect=sniff_csv_dialect(sample))
+        for row in reader:
+            code = row.get("codigo_portal", "").strip()
+            if code:
+                latest[code] = row
+    return latest
+
+
+def load_latest_statuses(output_root: Path) -> dict[str, str]:
+    return {
+        code: row.get("estado", "").strip()
+        for code, row in load_latest_status_rows(output_root).items()
+        if row.get("estado", "").strip()
+    }
+
+
+def write_targets_csv(path: Path, targets: Iterable[MunicipalityTarget]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=("municipalidad", "codigo_portal"),
+            delimiter=";",
+        )
+        writer.writeheader()
+        for target in targets:
+            writer.writerow(asdict(target))
+
+
+def write_followup_csvs(output_root: Path) -> None:
+    master_csv = output_root / "municipalidades_portal_345.csv"
+    if not master_csv.exists():
+        return
+
+    targets = load_targets_from_csv(master_csv)
+    latest = load_latest_statuses(output_root)
+    pending = [target for target in targets if target.codigo_portal not in latest]
+    retry = [
+        target
+        for target in targets
+        if latest.get(target.codigo_portal) in {"error", "parcial"}
+    ]
+    write_targets_csv(output_root / "municipalidades_pendientes_primera_pasada.csv", pending)
+    write_targets_csv(output_root / "municipalidades_para_reintentar.csv", retry)
+
+
+def write_failure_summary(output_root: Path) -> None:
+    failures_path = output_root / "fallas_scrapeo.txt"
+    failure_rows = [
+        row
+        for row in load_latest_status_rows(output_root).values()
+        if row.get("estado") in {"error", "parcial"}
+    ]
+    if not failure_rows:
+        failures_path.unlink(missing_ok=True)
+        return
+
+    lines = [
+        f"{row.get('municipalidad', '')} ({row.get('codigo_portal', '')}) "
+        f"[{row.get('estado', '')}]: {row.get('detalle', '')}"
+        for row in failure_rows
+    ]
+    failures_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_pid_file(output_root: Path) -> Path:
+    pid_path = output_root / "scraper_nacional.pid"
+    if pid_path.exists():
+        try:
+            existing_pid = int(pid_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            existing_pid = 0
+        if process_is_running(existing_pid):
+            raise PortalScraperError(
+                f"Ya existe un proceso de scrapeo activo con PID {existing_pid}."
+            )
+    pid_path.write_text(str(os.getpid()), encoding="ascii")
+    return pid_path
+
+
+def release_pid_file(pid_path: Path) -> None:
+    try:
+        if pid_path.read_text(encoding="ascii").strip() == str(os.getpid()):
+            pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def main(argv: list[str]) -> int:
@@ -999,55 +1411,87 @@ def main(argv: list[str]) -> int:
     existing_urls = load_existing_urls(output_root)
     completed_codes = load_completed_codes(output_root) if not args.force else set()
 
+    try:
+        pid_path = acquire_pid_file(output_root)
+    except PortalScraperError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr, flush=True)
+        return 2
+
     failures: list[str] = []
+    interrupted = False
 
-    for target in targets:
-        if target.codigo_portal in completed_codes:
-            print(f"[SKIP] Municipalidad completada: {target.municipalidad}", flush=True)
-            continue
+    try:
+        write_followup_csvs(output_root)
+        for target in targets:
+            if target.codigo_portal in completed_codes:
+                print(f"[SKIP] Municipalidad completada: {target.municipalidad}", flush=True)
+                continue
 
-        try:
-            records, extraction_errors = scrape_municipality(
-                target=target,
-                output_root=output_root,
-                years=years,
-                use_selenium=args.selenium,
-                browser=args.browser,
-                session=session,
-                existing_urls=existing_urls,
-                max_actas=args.max_actas,
-            )
-            metadata_path = write_metadata(records, output_root)
-            if args.max_actas:
-                status = "prueba"
-            elif extraction_errors:
-                status = "parcial"
-                failures.append(
-                    f"{target.municipalidad} ({target.codigo_portal}): "
-                    + " | ".join(extraction_errors)
+            try:
+                records, extraction_errors = scrape_municipality(
+                    target=target,
+                    output_root=output_root,
+                    years=years,
+                    use_selenium=args.selenium,
+                    browser=args.browser,
+                    session=session,
+                    existing_urls=existing_urls,
+                    max_actas=args.max_actas,
                 )
-            else:
-                status = "completado"
-            append_status(
-                output_root,
-                target,
-                status,
-                len(records),
-                " | ".join(extraction_errors),
-            )
-            print(f"[INFO] Metadata actualizada en {metadata_path}", flush=True)
+                metadata_path = write_metadata(records, output_root)
+                if extraction_errors:
+                    status = "parcial"
+                    failures.append(
+                        f"{target.municipalidad} ({target.codigo_portal}): "
+                        + " | ".join(extraction_errors)
+                    )
+                elif args.max_actas:
+                    status = "prueba"
+                elif not records:
+                    status = "sin_actas"
+                else:
+                    status = "completado"
+                append_status(
+                    output_root,
+                    target,
+                    status,
+                    len(records),
+                    " | ".join(extraction_errors),
+                )
+                write_followup_csvs(output_root)
+                write_failure_summary(output_root)
+                print(f"[INFO] Metadata actualizada en {metadata_path}", flush=True)
+            except Exception as exc:
+                failures.append(f"{target.municipalidad} ({target.codigo_portal}): {exc}")
+                append_status(output_root, target, "error", 0, str(exc))
+                write_followup_csvs(output_root)
+                write_failure_summary(output_root)
+                print(f"[ERROR] {failures[-1]}", file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[WARN] Ejecucion interrumpida por el usuario.", file=sys.stderr, flush=True)
+    finally:
+        try:
+            write_followup_csvs(output_root)
+            write_failure_summary(output_root)
         except Exception as exc:
-            failures.append(f"{target.municipalidad} ({target.codigo_portal}): {exc}")
-            append_status(output_root, target, "error", 0, str(exc))
-            print(f"[ERROR] {failures[-1]}", file=sys.stderr, flush=True)
+            print(
+                f"[WARN] No se pudieron actualizar las listas de seguimiento: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        release_pid_file(pid_path)
 
     if failures:
-        failures_path = output_root / "fallas_scrapeo.txt"
-        failures_path.write_text("\n".join(failures), encoding="utf-8")
-        print(f"[WARN] Hubo fallas. Revisa {failures_path}", file=sys.stderr, flush=True)
-        return 1
+        print(
+            f"[WARN] Hubo fallas. Revisa {output_root / 'fallas_scrapeo.txt'}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    return 0
+    if interrupted:
+        return 130
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
